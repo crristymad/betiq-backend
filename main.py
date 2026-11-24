@@ -193,3 +193,29 @@ def dashboard():
             for r in rows
         ]
     }
+import os
+import requests
+
+@app.get("/test-api-football")
+def test_api_football():
+    key = os.environ.get("API_FOOTBALL_KEY")
+    if not key:
+        return {"error": "API_FOOTBALL_KEY lipseste din Variables"}
+
+    resp = requests.get(
+        "https://v3.football.api-sports.io/fixtures",
+        headers={"x-apisports-key": key},
+        params={"league": 283, "season": 2023, "status": "FT"},
+        timeout=15,
+    )
+    data = resp.json()
+
+    return {
+        "http_status": resp.status_code,
+        "errors": data.get("errors"),
+        "results": data.get("results"),
+        "sample": [
+            f"{f['teams']['home']['name']} {f['goals']['home']}-{f['goals']['away']} {f['teams']['away']['name']}"
+            for f in data.get("response", [])[:3]
+        ],
+    }
