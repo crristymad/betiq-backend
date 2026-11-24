@@ -35,6 +35,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+# ---------------------------------------------------------------
+# Baza
+# ---------------------------------------------------------------
 @app.get("/")
 def root():
     return {"status": "online"}
@@ -157,9 +160,12 @@ def dashboard():
     return {"total_matches": len(bets), "best_bets": bets}
 
 
+# ---------------------------------------------------------------
+# Import din API-Football
+# ---------------------------------------------------------------
 @app.post("/import-league")
 def import_league(league: int = 283, season: int = 2023):
-    """Importa meciurile terminate (FT) dintr-o liga/sezon. Consuma 1 cerere API."""
+    """Importa meciurile terminate (FT). Consuma 1 cerere API."""
     key = os.environ.get("API_FOOTBALL_KEY")
     if not key:
         return {"error": "API_FOOTBALL_KEY lipseste din Variables"}
@@ -245,94 +251,15 @@ def import_league(league: int = 283, season: int = 2023):
         "inserted": inserted,
         "skipped": skipped,
     }
+
+
+# ---------------------------------------------------------------
+# Model Poisson
+# ---------------------------------------------------------------
 def poisson_pmf(k, lam):
     return math.exp(-lam) * lam**k / math.factorial(k)
 
 
-@app.get("/predict")
-def predict(home: str, away: str):
-    with engine.connect() as conn:
-
-        def find_team(name):
-            return conn.execute(
-                text("""
-                SELECT id, name FROM teams
-                WHERE api_id IS NOT NULL AND name ILIKE :n
-                ORDER BY name LIMIT 1
-                """),
-                {"n": f"%{name}%"},
-            ).fetchone()
-
-        h, a = find_team(home), find_team(away)
-        if not h or not a:
-            return {"error": "Echipa nu a fost gasita. Verifica numele in /teams"}
-
-        lg = conn.execute(
-            text("""
-            SELECT AVG(home_goals), AVG(away_goals) FROM matches
-            WHERE home_goals IS NOT NULL
-            """)
-        ).fetchone()
-        avg_h, avg_a = float(lg[0]), float(lg[1])
-
-        # gazda: goluri marcate / primite acasa
-        hs = conn.execute(
-            text("""
-            SELECT AVG(home_goals), AVG(away_goals), COUNT(*) FROM matches
-            WHERE home_team_id = :t AND home_goals IS NOT NULL
-            """),
-            {"t": h[0]},
-        ).fetchone()
-
-        # oaspete: goluri marcate / primite in deplasare
-        aw = conn.execute(
-            text("""
-            SELECT AVG(away_goals), AVG(home_goals), COUNT(*) FROM matches
-            WHERE away_team_id = :t AND home_goals IS NOT NULL
-            """),
-            {"t": a[0]},
-        ).fetchone()
-
-    if not hs[2] or not aw[2]:
-        return {"error": "Nu exista meciuri istorice pentru una dintre echipe"}
-
-    home_attack = float(hs[0]) / avg_h
-    home_defense = float(hs[1]) / avg_a
-    away_attack = float(aw[0]) / avg_a
-    away_defense = float(aw[1]) / avg_h
-
-    lam_h = avg_h * home_attack * away_defense
-    lam_a = avg_a * away_attack * home_defense
-
-    p_home = p_draw = p_away = 0.0
-    for i in range(11):
-        for j in range(11):
-            p = poisson_pmf(i, lam_h) * poisson_pmf(j, lam_a)
-            if i > j:
-                p_home += p
-            elif i == j:
-                p_draw += p
-            else:
-                p_away += p
-
-    total = p_home + p_draw + p_away
-    p_home, p_draw, p_away = p_home / total, p_draw / total, p_away / total
-
-    return {
-        "match": f"{h[1]} vs {a[1]}",
-        "expected_goals": {"home": round(lam_h, 2), "away": round(lam_a, 2)},
-        "probability": {
-            "home": round(p_home * 100, 1),
-            "draw": round(p_draw * 100, 1),
-            "away": round(p_away * 100, 1),
-        },
-        "fair_odds": {
-            "home": round(1 / p_home, 2),
-            "draw": round(1 / p_draw, 2),
-            "away": round(1 / p_away, 2),
-        },
-        "sample_games": {"home_team_home": hs[2], "away_team_away": aw[2]},
-    }
 def poisson_1x2(lam_h, lam_a, max_goals=10):
     p_home = p_draw = p_away = 0.0
     for i in range(max_goals + 1):
@@ -349,6 +276,7 @@ def poisson_1x2(lam_h, lam_a, max_goals=10):
 
 
 def predict_from_history(history, home_id, away_id, min_games=3, shrink=0.0):
+    """history = lista de (home_id, away_id, home_goals, away_goals)"""
     avg_h = sum(g[2] for g in history) / len(history)
     avg_a = sum(g[3] for g in history) / len(history)
 
@@ -368,8 +296,7 @@ def predict_from_history(history, home_id, away_id, min_games=3, shrink=0.0):
     return lam_h, lam_a, poisson_1x2(lam_h, lam_a)
 
 
-@app.get("/backtest-sample")
-def backtest_sample(warmup: int = 80, n: int = 40, shrink: float = 0.0):
+def load_history():
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
@@ -382,71 +309,13 @@ def backtest_sample(warmup: int = 80, n: int = 40, shrink: float = 0.0):
             ORDER BY m.kickoff, m.id
             """)
         ).fetchall()
-
     games = [(r[0], r[1], r[2], r[3]) for r in rows]
     names = [(r[4], r[5]) for r in rows]
+    return games, names
 
-    results = []
-    skipped = 0
-    b_model = b_naive = l_model = l_naive = 0.0
 
-    for i in range(warmup, min(warmup + n, len(games))):
-        history = games[:i]
-        hid, aid, hg, ag = games[i]
-
-        pred = predict_from_history(history, hid, aid, shrink=shrink)
-        if pred is None:
-            skipped += 1
-            continue
-        lam_h, lam_a, model_p = pred
-
-        # varianta naiva: frecventa rezultatelor de pana atunci
-        naive_p = (
-            sum(1 for g in history if g[2] > g[3]) / len(history),
-            sum(1 for g in history if g[2] == g[3]) / len(history),
-            sum(1 for g in history if g[2] < g[3]) / len(history),
-        )
-
-        actual = 0 if hg > ag else (1 if hg == ag else 2)
-        outcome = [1 if k == actual else 0 for k in range(3)]
-
-        b_m = sum((model_p[k] - outcome[k]) ** 2 for k in range(3))
-        b_n = sum((naive_p[k] - outcome[k]) ** 2 for k in range(3))
-        b_model += b_m
-        b_naive += b_n
-        l_model += -math.log(max(model_p[actual], 1e-9))
-        l_naive += -math.log(max(naive_p[actual], 1e-9))
-
-        results.append({
-            "match": f"{names[i][0]} {hg}-{ag} {names[i][1]}",
-            "model_1x2": [round(p * 100, 1) for p in model_p],
-            "naive_1x2": [round(p * 100, 1) for p in naive_p],
-            "actual": ["1", "X", "2"][actual],
-        })
-
-    k = len(results)
-    if k == 0:
-        return {"error": "Nu s-au putut evalua meciuri", "skipped": skipped}
-
-    return {
-        "evaluated": k,
-        "skipped": skipped,
-        "model": {"brier": round(b_model / k, 4), "log_loss": round(l_model / k, 4)},
-        "naive": {"brier": round(b_naive / k, 4), "log_loss": round(l_naive / k, 4)},
-        "reference_random_guess": {"brier": 0.6667, "log_loss": 1.0986},
-        "model_better_than_naive": b_model < b_naive,
-        "matches": results,
-    }
-@app.get("/value-check")
-def value_check(
-    home: str,
-    away: str,
-    odd_home: float,
-    odd_draw: float,
-    odd_away: float,
-    shrink: float = 10.0,
-    min_edge: float = 0.05,
-):
+@app.get("/predict")
+def predict(home: str, away: str, shrink: float = 0.0):
     with engine.connect() as conn:
 
         def find_team(name):
@@ -460,64 +329,90 @@ def value_check(
             ).fetchone()
 
         h, a = find_team(home), find_team(away)
-        if not h or not a:
-            return {"error": "Echipa nu a fost gasita. Verifica numele in /teams"}
 
-        rows = conn.execute(
-            text("""
-            SELECT home_team_id, away_team_id, home_goals, away_goals
-            FROM matches
-            WHERE api_id IS NOT NULL AND home_goals IS NOT NULL
-            ORDER BY kickoff, id
-            """)
-        ).fetchall()
+    if not h or not a:
+        return {"error": "Echipa nu a fost gasita. Verifica numele in /teams"}
 
-    games = [(r[0], r[1], r[2], r[3]) for r in rows]
+    games, _ = load_history()
     pred = predict_from_history(games, h[0], a[0], shrink=shrink)
     if pred is None:
         return {"error": "Prea putine meciuri istorice pentru una dintre echipe"}
 
-    lam_h, lam_a, probs = pred
-    odds = [odd_home, odd_draw, odd_away]
-    labels = ["home", "draw", "away"]
-
-    # probabilitatea implicita a pietei, fara marja casei
-    inv = [1 / o for o in odds]
-    overround = sum(inv)
-    market = [x / overround for x in inv]
-
-    outcomes = []
-    best = None
-    for k in range(3):
-        edge = probs[k] * odds[k] - 1
-        item = {
-            "outcome": labels[k],
-            "odd": odds[k],
-            "model_prob_pct": round(probs[k] * 100, 1),
-            "market_prob_pct": round(market[k] * 100, 1),
-            "fair_odd": round(1 / probs[k], 2),
-            "edge_pct": round(edge * 100, 1),
-        }
-        outcomes.append(item)
-        if best is None or edge > best[0]:
-            best = (edge, labels[k])
-
-    best_edge, best_label = best
-    if best_edge >= 0.15:
-        verdict = f"Edge foarte mare pe {best_label}: suspect, probabil greseste modelul. Nu paria pe baza asta."
-    elif best_edge >= min_edge:
-        verdict = f"Edge teoretic pozitiv pe {best_label}, dar avantajul modelului e mic. Interpreteaza cu prudenta."
-    else:
-        verdict = "Nu paria: nicio cota nu depaseste pragul de edge."
-
+    lam_h, lam_a, (p_home, p_draw, p_away) = pred
     return {
         "match": f"{h[1]} vs {a[1]}",
         "shrink": shrink,
-        "bookmaker_margin_pct": round((overround - 1) * 100, 1),
-        "outcomes": outcomes,
-        "verdict": verdict,
-        "warning": "Model antrenat pe date 2021-2023, cu avantaj mic fata de frecventa simpla a rezultatelor. Nu e sfat financiar.",
+        "expected_goals": {"home": round(lam_h, 2), "away": round(lam_a, 2)},
+        "probability": {
+            "home": round(p_home * 100, 1),
+            "draw": round(p_draw * 100, 1),
+            "away": round(p_away * 100, 1),
+        },
+        "fair_odds": {
+            "home": round(1 / p_home, 2),
+            "draw": round(1 / p_draw, 2),
+            "away": round(1 / p_away, 2),
+        },
     }
+
+
+@app.get("/backtest-sample")
+def backtest_sample(warmup: int = 80, n: int = 40, shrink: float = 0.0, details: bool = False):
+    games, names = load_history()
+
+    results = []
+    skipped = 0
+    b_model = b_naive = l_model = l_naive = 0.0
+    evaluated = 0
+
+    for i in range(warmup, min(warmup + n, len(games))):
+        history = games[:i]
+        hid, aid, hg, ag = games[i]
+
+        pred = predict_from_history(history, hid, aid, shrink=shrink)
+        if pred is None:
+            skipped += 1
+            continue
+        _, _, model_p = pred
+
+        naive_p = (
+            sum(1 for g in history if g[2] > g[3]) / len(history),
+            sum(1 for g in history if g[2] == g[3]) / len(history),
+            sum(1 for g in history if g[2] < g[3]) / len(history),
+        )
+
+        actual = 0 if hg > ag else (1 if hg == ag else 2)
+        outcome = [1 if k == actual else 0 for k in range(3)]
+
+        b_model += sum((model_p[k] - outcome[k]) ** 2 for k in range(3))
+        b_naive += sum((naive_p[k] - outcome[k]) ** 2 for k in range(3))
+        l_model += -math.log(max(model_p[actual], 1e-9))
+        l_naive += -math.log(max(naive_p[actual], 1e-9))
+        evaluated += 1
+
+        if details:
+            results.append({
+                "match": f"{names[i][0]} {hg}-{ag} {names[i][1]}",
+                "model_1x2": [round(p * 100, 1) for p in model_p],
+                "naive_1x2": [round(p * 100, 1) for p in naive_p],
+                "actual": ["1", "X", "2"][actual],
+            })
+
+    if evaluated == 0:
+        return {"error": "Nu s-au putut evalua meciuri", "skipped": skipped}
+
+    out = {
+        "evaluated": evaluated,
+        "skipped": skipped,
+        "shrink": shrink,
+        "model": {"brier": round(b_model / evaluated, 4), "log_loss": round(l_model / evaluated, 4)},
+        "naive": {"brier": round(b_naive / evaluated, 4), "log_loss": round(l_naive / evaluated, 4)},
+        "reference_random_guess": {"brier": 0.6667, "log_loss": 1.0986},
+        "model_better_than_naive": b_model < b_naive,
+    }
+    if details:
+        out["matches"] = results
+    return out
 
 
 def _fd_num(v):
@@ -687,6 +582,152 @@ def import_fd_all(
             time.sleep(pause)
 
     return {"files_tried": files, "total_inserted": total, "failed": failed}
+
+
+@app.get("/backtest-sweep")
+def backtest_sweep(warmup: int = 80, n: int = 240, shrinks: str = "0,5,10,20,40"):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+            SELECT m.home_team_id, m.away_team_id, m.home_goals, m.away_goals
+            FROM matches m
+            WHERE m.api_id IS NOT NULL AND m.home_goals IS NOT NULL
+            ORDER BY m.kickoff, m.id
+            """)
+        ).fetchall()
+
+    games = [(r[0], r[1], r[2], r[3]) for r in rows]
+    values = [float(s) for s in shrinks.split(",") if s.strip()]
+
+    table = []
+    for shrink in values:
+        b_model = b_naive = l_model = l_naive = 0.0
+        evaluated = 0
+
+        for i in range(warmup, min(warmup + n, len(games))):
+            history = games[:i]
+            hid, aid, hg, ag = games[i]
+
+            pred = predict_from_history(history, hid, aid, shrink=shrink)
+            if pred is None:
+                continue
+            model_p = pred[2]
+
+            naive_p = (
+                sum(1 for g in history if g[2] > g[3]) / len(history),
+                sum(1 for g in history if g[2] == g[3]) / len(history),
+                sum(1 for g in history if g[2] < g[3]) / len(history),
+            )
+
+            actual = 0 if hg > ag else (1 if hg == ag else 2)
+            outcome = [1 if k == actual else 0 for k in range(3)]
+
+            b_model += sum((model_p[k] - outcome[k]) ** 2 for k in range(3))
+            b_naive += sum((naive_p[k] - outcome[k]) ** 2 for k in range(3))
+            l_model += -math.log(max(model_p[actual], 1e-9))
+            l_naive += -math.log(max(naive_p[actual], 1e-9))
+            evaluated += 1
+
+        if evaluated == 0:
+            table.append({"shrink": shrink, "error": "nu s-au evaluat meciuri"})
+            continue
+
+        table.append({
+            "shrink": shrink,
+            "evaluated": evaluated,
+            "model_brier": round(b_model / evaluated, 4),
+            "naive_brier": round(b_naive / evaluated, 4),
+            "model_logloss": round(l_model / evaluated, 4),
+            "naive_logloss": round(l_naive / evaluated, 4),
+            "model_better_than_naive": b_model < b_naive,
+        })
+
+    return {"results": table}
+
+
+@app.get("/value-check")
+def value_check(
+    home: str,
+    away: str,
+    odd_home: float,
+    odd_draw: float,
+    odd_away: float,
+    shrink: float = 10.0,
+    min_edge: float = 0.05,
+):
+    with engine.connect() as conn:
+
+        def find_team(name):
+            return conn.execute(
+                text("""
+                SELECT id, name FROM teams
+                WHERE api_id IS NOT NULL AND name ILIKE :n
+                ORDER BY name LIMIT 1
+                """),
+                {"n": f"%{name}%"},
+            ).fetchone()
+
+        h, a = find_team(home), find_team(away)
+        if not h or not a:
+            return {"error": "Echipa nu a fost gasita. Verifica numele in /teams"}
+
+        rows = conn.execute(
+            text("""
+            SELECT home_team_id, away_team_id, home_goals, away_goals
+            FROM matches
+            WHERE api_id IS NOT NULL AND home_goals IS NOT NULL
+            ORDER BY kickoff, id
+            """)
+        ).fetchall()
+
+    games = [(r[0], r[1], r[2], r[3]) for r in rows]
+    pred = predict_from_history(games, h[0], a[0], shrink=shrink)
+    if pred is None:
+        return {"error": "Prea putine meciuri istorice pentru una dintre echipe"}
+
+    lam_h, lam_a, probs = pred
+    odds = [odd_home, odd_draw, odd_away]
+    labels = ["home", "draw", "away"]
+
+    # probabilitatea implicita a pietei, fara marja casei
+    inv = [1 / o for o in odds]
+    overround = sum(inv)
+    market = [x / overround for x in inv]
+
+    outcomes = []
+    best = None
+    for k in range(3):
+        edge = probs[k] * odds[k] - 1
+        item = {
+            "outcome": labels[k],
+            "odd": odds[k],
+            "model_prob_pct": round(probs[k] * 100, 1),
+            "market_prob_pct": round(market[k] * 100, 1),
+            "fair_odd": round(1 / probs[k], 2),
+            "edge_pct": round(edge * 100, 1),
+        }
+        outcomes.append(item)
+        if best is None or edge > best[0]:
+            best = (edge, labels[k])
+
+    best_edge, best_label = best
+    if best_edge >= 0.15:
+        verdict = f"Edge foarte mare pe {best_label}: suspect, probabil greseste modelul. Nu paria pe baza asta."
+    elif best_edge >= min_edge:
+        verdict = f"Edge teoretic pozitiv pe {best_label}, dar avantajul modelului e mic. Interpreteaza cu prudenta."
+    else:
+        verdict = "Nu paria: nicio cota nu depaseste pragul de edge."
+
+    return {
+        "match": f"{h[1]} vs {a[1]}",
+        "shrink": shrink,
+        "bookmaker_margin_pct": round((overround - 1) * 100, 1),
+        "outcomes": outcomes,
+        "verdict": verdict,
+        "warning": "Model antrenat pe date 2021-2023, cu avantaj mic fata de frecventa simpla a rezultatelor. Nu e sfat financiar.",
+    }
+
+
 @app.get("/backtest-odds")
 def backtest_odds(
     leagues: str = "E0",
@@ -725,13 +766,14 @@ def backtest_odds(
 
     by_league = []
     all_model, all_base = [], []
+    season_stats = {}
 
     with engine.connect() as conn:
         for lg in league_list:
             rows = conn.execute(
                 text("""
                 SELECT home, away, hg, ag,
-                       odd_h, odd_a, close_h, close_a
+                       odd_h, odd_a, close_h, close_a, season
                 FROM hist_matches
                 WHERE league = :l
                 ORDER BY match_date, id
@@ -769,7 +811,10 @@ def backtest_odds(
 
                 # baseline: favoritul cu cota cea mai mica din interval
                 side_b, odd_b = min(cands, key=lambda c: c[1])
-                base.append(result(side_b, odd_b))
+                pb = result(side_b, odd_b)
+                base.append(pb)
+                st = season_stats.setdefault(r[8], {"base": [], "model": []})
+                st["base"].append(pb)
 
                 pred = predict_from_history(games[:i], r[0], r[1], shrink=shrink)
                 if pred is None:
@@ -781,7 +826,9 @@ def backtest_odds(
                 ]
                 side_m, odd_m, p_m = max(options, key=lambda o: o[2])
                 if p_m * odd_m - 1 >= min_edge:
-                    model.append(result(side_m, odd_m))
+                    pm = result(side_m, odd_m)
+                    model.append(pm)
+                    st["model"].append(pm)
 
             all_base += base
             all_model += model
@@ -799,5 +846,13 @@ def backtest_odds(
         },
         "total": {"baseline": summarize(all_base), "model": summarize(all_model)},
         "by_league": by_league,
+        "by_season": [
+            {
+                "season": s,
+                "baseline": summarize(v["base"]),
+                "model": summarize(v["model"]),
+            }
+            for s, v in sorted(season_stats.items())
+        ],
         "note": "roi_se_pct = eroarea standard; daca |roi_pct| < 2 * roi_se_pct, rezultatul nu e diferit de zgomot.",
     }
