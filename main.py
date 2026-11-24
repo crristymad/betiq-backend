@@ -348,8 +348,7 @@ def poisson_1x2(lam_h, lam_a, max_goals=10):
     return p_home / total, p_draw / total, p_away / total
 
 
-def predict_from_history(history, home_id, away_id, min_games=3):
-    """history = lista de (home_id, away_id, home_goals, away_goals)"""
+def predict_from_history(history, home_id, away_id, min_games=3, shrink=0.0):
     avg_h = sum(g[2] for g in history) / len(history)
     avg_a = sum(g[3] for g in history) / len(history)
 
@@ -357,11 +356,12 @@ def predict_from_history(history, home_id, away_id, min_games=3):
     away_games = [g for g in history if g[1] == away_id]
     if len(home_games) < min_games or len(away_games) < min_games:
         return None
+    n_h, n_a = len(home_games), len(away_games)
 
-    home_attack = (sum(g[2] for g in home_games) / len(home_games)) / avg_h
-    home_defense = (sum(g[3] for g in home_games) / len(home_games)) / avg_a
-    away_attack = (sum(g[3] for g in away_games) / len(away_games)) / avg_a
-    away_defense = (sum(g[2] for g in away_games) / len(away_games)) / avg_h
+    home_attack = ((sum(g[2] for g in home_games) + shrink * avg_h) / (n_h + shrink)) / avg_h
+    home_defense = ((sum(g[3] for g in home_games) + shrink * avg_a) / (n_h + shrink)) / avg_a
+    away_attack = ((sum(g[3] for g in away_games) + shrink * avg_a) / (n_a + shrink)) / avg_a
+    away_defense = ((sum(g[2] for g in away_games) + shrink * avg_h) / (n_a + shrink)) / avg_h
 
     lam_h = avg_h * home_attack * away_defense
     lam_a = avg_a * away_attack * home_defense
