@@ -518,3 +518,139 @@ def value_check(
         "verdict": verdict,
         "warning": "Model antrenat pe date 2021-2023, cu avantaj mic fata de frecventa simpla a rezultatelor. Nu e sfat financiar.",
     }
+
+
+def _fd_num(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def _fd_int(v):
+    n = _fd_num(v)
+    return int(n) if n is not None else None
+
+
+def _fd_date(s):
+    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def parse_fd_rows(rows, league, season):
+    """Transforma randurile CSV football-data.co.uk in dictionare pentru baza de date."""
+    out = []
+    for r in rows:
+        d = _fd_date(r.get("Date"))
+        hg, ag = _fd_int(r.get("FTHG")), _fd_int(r.get("FTAG"))
+        home, away = r.get("HomeTeam"), r.get("AwayTeam")
+        if d is None or hg is None or ag is None or not home or not away:
+            continue
+        out.append({
+            "league": league,
+            "season": season,
+            "d": d,
+            "home": home.strip(),
+            "away": away.strip(),
+            "hg": hg,
+            "ag": ag,
+            # cote inainte de meci (Bet365), cu varianta medie ca rezerva
+            "oh": _fd_num(r.get("B365H")) or _fd_num(r.get("AvgH")),
+            "od": _fd_num(r.get("B365D")) or _fd_num(r.get("AvgD")),
+            "oa": _fd_num(r.get("B365A")) or _fd_num(r.get("AvgA")),
+            # cote medii de inchidere
+            "ch": _fd_num(r.get("AvgCH")),
+            "cd": _fd_num(r.get("AvgCD")),
+            "ca": _fd_num(r.get("AvgCA")),
+            "hy": _fd_int(r.get("HY")),
+            "ay": _fd_int(r.get("AY")),
+            "hr": _fd_int(r.get("HR")),
+            "ar": _fd_int(r.get("AR")),
+        })
+    return out
+
+
+@app.post("/import-fd")
+def import_fd(league: str = "E0", season: str = "2526"):
+    """Importa un fisier football-data.co.uk (ex: E0, sezonul 2526 = 2025/26)."""
+    import csv
+    import io
+
+    url = f"https://www.football-data.co.uk/mmz4281/{season}/{league}.csv"
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}", "url": url}
+
+    try:
+        content = resp.content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        content = resp.content.decode("latin-1")
+
+    rows = list(csv.DictReader(io.StringIO(content)))
+    parsed = parse_fd_rows(rows, league, season)
+
+    inserted = 0
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS hist_matches (
+                id SERIAL PRIMARY KEY,
+                league TEXT NOT NULL,
+                season TEXT NOT NULL,
+                match_date DATE NOT NULL,
+                home TEXT NOT NULL,
+                away TEXT NOT NULL,
+                hg INTEGER NOT NULL,
+                ag INTEGER NOT NULL,
+                odd_h NUMERIC, odd_d NUMERIC, odd_a NUMERIC,
+                close_h NUMERIC, close_d NUMERIC, close_a NUMERIC,
+                hy INTEGER, ay INTEGER, hr INTEGER, ar INTEGER,
+                UNIQUE (league, season, match_date, home, away)
+            )
+        """))
+        for p in parsed:
+            res = conn.execute(
+                text("""
+                INSERT INTO hist_matches
+                    (league, season, match_date, home, away, hg, ag,
+                     odd_h, odd_d, odd_a, close_h, close_d, close_a,
+                     hy, ay, hr, ar)
+                VALUES
+                    (:league, :season, :d, :home, :away, :hg, :ag,
+                     :oh, :od, :oa, :ch, :cd, :ca,
+                     :hy, :ay, :hr, :ar)
+                ON CONFLICT (league, season, match_date, home, away) DO NOTHING
+                """),
+                p,
+            )
+            inserted += res.rowcount
+
+    return {
+        "url": url,
+        "rows_in_file": len(rows),
+        "parsed": len(parsed),
+        "inserted": inserted,
+        "with_odds": sum(1 for p in parsed if p["oh"] and p["od"] and p["oa"]),
+    }
+
+
+@app.get("/hist-summary")
+def hist_summary():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT league, season, COUNT(*), MIN(match_date), MAX(match_date),
+                   COUNT(odd_h)
+            FROM hist_matches
+            GROUP BY league, season
+            ORDER BY league, season
+        """)).fetchall()
+    return [
+        {
+            "league": r[0], "season": r[1], "matches": r[2],
+            "from": str(r[3]), "to": str(r[4]), "with_odds": r[5],
+        }
+        for r in rows
+    ]
