@@ -5,16 +5,27 @@ from database import engine
 
 app = FastAPI()
 
+
 @app.get("/")
 def root():
     return {
         "status": "online"
     }
 
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
+
+
 @app.get("/db")
 def db():
     try:
+
         with engine.connect() as conn:
+
             version = conn.execute(
                 text("SELECT version();")
             ).scalar()
@@ -25,16 +36,12 @@ def db():
         }
 
     except Exception as e:
+
         return {
             "error": str(e)
         }
 
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy"
-    }
-from sqlalchemy import text
+
 @app.get("/teams")
 def teams():
 
@@ -42,7 +49,10 @@ def teams():
 
         rows = conn.execute(
             text("""
-            SELECT id,name,short_name
+            SELECT
+                id,
+                name,
+                short_name
             FROM teams
             ORDER BY name
             """)
@@ -56,6 +66,8 @@ def teams():
         }
         for r in rows
     ]
+
+
 @app.get("/matches")
 def matches():
 
