@@ -369,7 +369,7 @@ def predict_from_history(history, home_id, away_id, min_games=3, shrink=0.0):
 
 
 @app.get("/backtest-sample")
-def backtest_sample(warmup: int = 80, n: int = 40):
+def backtest_sample(warmup: int = 80, n: int = 40, shrink: float = 0.0):
     with engine.connect() as conn:
         rows = conn.execute(
             text("""
@@ -394,7 +394,7 @@ def backtest_sample(warmup: int = 80, n: int = 40):
         history = games[:i]
         hid, aid, hg, ag = games[i]
 
-        pred = predict_from_history(history, hid, aid)
+       pred = predict_from_history(history, hid, aid, shrink=shrink)
         if pred is None:
             skipped += 1
             continue
