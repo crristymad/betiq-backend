@@ -1,3 +1,4 @@
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -243,4 +244,92 @@ def import_league(league: int = 283, season: int = 2023):
         "received": len(fixtures),
         "inserted": inserted,
         "skipped": skipped,
+    }
+def poisson_pmf(k, lam):
+    return math.exp(-lam) * lam**k / math.factorial(k)
+
+
+@app.get("/predict")
+def predict(home: str, away: str):
+    with engine.connect() as conn:
+
+        def find_team(name):
+            return conn.execute(
+                text("""
+                SELECT id, name FROM teams
+                WHERE api_id IS NOT NULL AND name ILIKE :n
+                ORDER BY name LIMIT 1
+                """),
+                {"n": f"%{name}%"},
+            ).fetchone()
+
+        h, a = find_team(home), find_team(away)
+        if not h or not a:
+            return {"error": "Echipa nu a fost gasita. Verifica numele in /teams"}
+
+        lg = conn.execute(
+            text("""
+            SELECT AVG(home_goals), AVG(away_goals) FROM matches
+            WHERE home_goals IS NOT NULL
+            """)
+        ).fetchone()
+        avg_h, avg_a = float(lg[0]), float(lg[1])
+
+        # gazda: goluri marcate / primite acasa
+        hs = conn.execute(
+            text("""
+            SELECT AVG(home_goals), AVG(away_goals), COUNT(*) FROM matches
+            WHERE home_team_id = :t AND home_goals IS NOT NULL
+            """),
+            {"t": h[0]},
+        ).fetchone()
+
+        # oaspete: goluri marcate / primite in deplasare
+        aw = conn.execute(
+            text("""
+            SELECT AVG(away_goals), AVG(home_goals), COUNT(*) FROM matches
+            WHERE away_team_id = :t AND home_goals IS NOT NULL
+            """),
+            {"t": a[0]},
+        ).fetchone()
+
+    if not hs[2] or not aw[2]:
+        return {"error": "Nu exista meciuri istorice pentru una dintre echipe"}
+
+    home_attack = float(hs[0]) / avg_h
+    home_defense = float(hs[1]) / avg_a
+    away_attack = float(aw[0]) / avg_a
+    away_defense = float(aw[1]) / avg_h
+
+    lam_h = avg_h * home_attack * away_defense
+    lam_a = avg_a * away_attack * home_defense
+
+    p_home = p_draw = p_away = 0.0
+    for i in range(11):
+        for j in range(11):
+            p = poisson_pmf(i, lam_h) * poisson_pmf(j, lam_a)
+            if i > j:
+                p_home += p
+            elif i == j:
+                p_draw += p
+            else:
+                p_away += p
+
+    total = p_home + p_draw + p_away
+    p_home, p_draw, p_away = p_home / total, p_draw / total, p_away / total
+
+    return {
+        "match": f"{h[1]} vs {a[1]}",
+        "expected_goals": {"home": round(lam_h, 2), "away": round(lam_a, 2)},
+        "probability": {
+            "home": round(p_home * 100, 1),
+            "draw": round(p_draw * 100, 1),
+            "away": round(p_away * 100, 1),
+        },
+        "fair_odds": {
+            "home": round(1 / p_home, 2),
+            "draw": round(1 / p_draw, 2),
+            "away": round(1 / p_away, 2),
+        },
+        "sample_games": {"home_team_home": hs[2], "away_team_away": aw[2]},
     }
