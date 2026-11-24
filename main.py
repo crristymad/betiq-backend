@@ -219,3 +219,60 @@ def test_api_football():
             for f in data.get("response", [])[:3]
         ],
     }
+@app.get("/import-one")
+def import_one():
+    key = os.environ.get("API_FOOTBALL_KEY")
+    if not key:
+        return {"error": "API_FOOTBALL_KEY lipseste"}
+
+    resp = requests.get(
+        "https://v3.football.api-sports.io/fixtures",
+        headers={"x-apisports-key": key},
+        params={"league": 283, "season": 2023, "status": "FT"},
+        timeout=15,
+    )
+    f = resp.json()["response"][0]
+
+    with engine.begin() as conn:
+        # coloane noi (se adauga doar daca nu exista)
+        conn.execute(text("ALTER TABLE teams ADD COLUMN IF NOT EXISTS api_id INTEGER"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS teams_api_id_idx ON teams(api_id)"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS api_id INTEGER"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS home_goals INTEGER"))
+        conn.execute(text("ALTER TABLE matches ADD COLUMN IF NOT EXISTS away_goals INTEGER"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS matches_api_id_idx ON matches(api_id)"))
+
+        def get_team_id(t):
+            row = conn.execute(
+                text("SELECT id FROM teams WHERE api_id = :a"), {"a": t["id"]}
+            ).fetchone()
+            if row:
+                return row[0]
+            return conn.execute(
+                text("""INSERT INTO teams (name, short_name, api_id)
+                        VALUES (:n, :s, :a) RETURNING id"""),
+                {"n": t["name"], "s": t["name"][:3].upper(), "a": t["id"]},
+            ).scalar()
+
+        home_id = get_team_id(f["teams"]["home"])
+        away_id = get_team_id(f["teams"]["away"])
+
+        match_id = conn.execute(
+            text("""INSERT INTO matches
+                    (home_team_id, away_team_id, kickoff, status,
+                     api_id, home_goals, away_goals)
+                    VALUES (:h, :a, :k, 'FT', :api, :hg, :ag)
+                    ON CONFLICT (api_id) DO NOTHING
+                    RETURNING id"""),
+            {
+                "h": home_id, "a": away_id,
+                "k": f["fixture"]["date"],
+                "api": f["fixture"]["id"],
+                "hg": f["goals"]["home"], "ag": f["goals"]["away"],
+            },
+        ).scalar()
+
+    return {
+        "saved_match_id": match_id,  # None = exista deja
+        "match": f"{f['teams']['home']['name']} {f['goals']['home']}-{f['goals']['away']} {f['teams']['away']['name']}",
+    }
