@@ -856,3 +856,339 @@ def backtest_odds(
         ],
         "note": "roi_se_pct = eroarea standard; daca |roi_pct| < 2 * roi_se_pct, rezultatul nu e diferit de zgomot.",
     }
+
+
+@app.get("/team-profile")
+def team_profile(league: str, team: str, n: int = 8):
+    """Forma, split acasa/deplasare si cartonase pentru o echipa, din hist_matches."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+            SELECT home FROM hist_matches
+            WHERE league = :l AND home ILIKE :t
+            GROUP BY home ORDER BY COUNT(*) DESC LIMIT 1
+            """),
+            {"l": league, "t": f"%{team}%"},
+        ).fetchone()
+        if not row:
+            return {"error": "Echipa nu a fost gasita in aceasta liga"}
+        name = row[0]
+
+        rows = conn.execute(
+            text("""
+            SELECT match_date, home, away, hg, ag, hy, ay, hr, ar
+            FROM hist_matches
+            WHERE league = :l AND (home = :n OR away = :n)
+            ORDER BY match_date DESC, id DESC
+            LIMIT 40
+            """),
+            {"l": league, "n": name},
+        ).fetchall()
+
+    games = []
+    for r in rows:
+        is_home = r[1] == name
+        gf, ga = (r[3], r[4]) if is_home else (r[4], r[3])
+        yc, rc = (r[5], r[7]) if is_home else (r[6], r[8])
+        res = "W" if gf > ga else ("D" if gf == ga else "L")
+        games.append({
+            "date": str(r[0]),
+            "venue": "H" if is_home else "A",
+            "opponent": r[2] if is_home else r[1],
+            "score": f"{gf}-{ga}",
+            "result": res,
+            "yellow": yc,
+            "red": rc,
+            "_gf": gf, "_ga": ga,
+        })
+
+    def summarize(g):
+        if not g:
+            return {"matches": 0}
+        pts = sum(3 if x["result"] == "W" else 1 if x["result"] == "D" else 0 for x in g)
+        yc = [x["yellow"] for x in g if x["yellow"] is not None]
+        rc = [x["red"] for x in g if x["red"] is not None]
+        return {
+            "matches": len(g),
+            "form": "".join(x["result"] for x in g),
+            "points": pts,
+            "points_per_match": round(pts / len(g), 2),
+            "goals_for": sum(x["_gf"] for x in g),
+            "goals_against": sum(x["_ga"] for x in g),
+            "avg_yellow": round(sum(yc) / len(yc), 2) if yc else None,
+            "avg_red": round(sum(rc) / len(rc), 2) if rc else None,
+        }
+
+    last = games[:n]
+    home_g = [x for x in games if x["venue"] == "H"][:5]
+    away_g = [x for x in games if x["venue"] == "A"][:5]
+
+    return {
+        "team": name,
+        "league": league,
+        "last_n": summarize(last),
+        "last_5_home": summarize(home_g),
+        "last_5_away": summarize(away_g),
+        "matches": [{k: v for k, v in x.items() if not k.startswith("_")} for x in last],
+    }
+
+
+FORM_CHART_HTML = """<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BetIQ - Forma echipei</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 12px; color: #1a1a1a; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  input, button { padding: 8px 10px; font-size: 14px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 16px 0; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 10px 12px; }
+  .card h3 { margin: 0 0 6px; font-size: 14px; color: #555; }
+  .big { font-size: 20px; font-weight: 600; letter-spacing: 2px; }
+  .err { color: #b00020; }
+  .chart-box { position: relative; height: 320px; }
+</style>
+</head>
+<body>
+<h2 id="title">Forma echipei</h2>
+<form id="f">
+  <input name="league" placeholder="liga (ex: E0)" value="E0">
+  <input name="team" placeholder="echipa (ex: Liverpool)" value="Liverpool">
+  <input name="n" type="number" min="3" max="20" value="8" style="width:70px">
+  <button type="submit">Arata</button>
+</form>
+<div id="msg" class="err"></div>
+<div class="cards" id="cards"></div>
+<div class="chart-box"><canvas id="chart"></canvas></div>
+<p style="font-size:12px;color:#666">Puncte pe meci: victorie 3, egal 1, infrangere 0. Date: hist_matches. Informativ, nu recomandare de pariuri.</p>
+<script>
+var chart = null;
+var PTS = { W: 3, D: 1, L: 0 };
+var COLOR = { W: "#2e9e5b", D: "#e0a800", L: "#d64545" };
+
+function card(title, s) {
+  var d = document.createElement("div");
+  d.className = "card";
+  var h = document.createElement("h3");
+  h.textContent = title;
+  d.appendChild(h);
+  var big = document.createElement("div");
+  big.className = "big";
+  big.textContent = s.matches ? s.form : "-";
+  d.appendChild(big);
+  var p = document.createElement("div");
+  p.textContent = s.matches
+    ? s.points_per_match + " p/meci | goluri " + s.goals_for + "-" + s.goals_against +
+      " | galbene " + s.avg_yellow + " | rosii " + s.avg_red
+    : "fara date";
+  d.appendChild(p);
+  return d;
+}
+
+async function load(params) {
+  var msg = document.getElementById("msg");
+  msg.textContent = "";
+  var url = "/team-profile?league=" + encodeURIComponent(params.league) +
+            "&team=" + encodeURIComponent(params.team) + "&n=" + encodeURIComponent(params.n);
+  var data;
+  try {
+    var r = await fetch(url);
+    data = await r.json();
+  } catch (e) {
+    msg.textContent = "Eroare la incarcarea datelor.";
+    return;
+  }
+  if (data.error) { msg.textContent = data.error; return; }
+
+  document.getElementById("title").textContent = "Forma: " + data.team + " (" + data.league + ")";
+  var cards = document.getElementById("cards");
+  cards.textContent = "";
+  cards.appendChild(card("Ultimele " + params.n + " meciuri", data.last_n));
+  cards.appendChild(card("Ultimele 5 acasa", data.last_5_home));
+  cards.appendChild(card("Ultimele 5 in deplasare", data.last_5_away));
+
+  var ms = data.matches.slice().reverse();
+  var labels = ms.map(function (m) { return m.date + " " + m.venue + " " + m.opponent + " " + m.score; });
+  var values = ms.map(function (m) { return PTS[m.result]; });
+  var colors = ms.map(function (m) { return COLOR[m.result]; });
+
+  if (chart) chart.destroy();
+  chart = new Chart(document.getElementById("chart"), {
+    type: "bar",
+    data: { labels: labels, datasets: [{ label: "Puncte", data: values, backgroundColor: colors }] },
+    options: {
+      maintainAspectRatio: false,
+      scales: { y: { min: 0, max: 3, ticks: { stepSize: 1 } }, x: { ticks: { maxRotation: 60, minRotation: 40 } } },
+      plugins: { legend: { display: false } }
+    }
+  });
+}
+
+function paramsFromUrl() {
+  var q = new URLSearchParams(location.search);
+  return { league: q.get("league") || "E0", team: q.get("team") || "Liverpool", n: q.get("n") || "8" };
+}
+
+document.getElementById("f").addEventListener("submit", function (e) {
+  e.preventDefault();
+  var fd = new FormData(e.target);
+  var p = { league: fd.get("league"), team: fd.get("team"), n: fd.get("n") };
+  history.replaceState(null, "", "?league=" + encodeURIComponent(p.league) +
+    "&team=" + encodeURIComponent(p.team) + "&n=" + encodeURIComponent(p.n));
+  load(p);
+});
+
+var init = paramsFromUrl();
+document.querySelector("[name=league]").value = init.league;
+document.querySelector("[name=team]").value = init.team;
+document.querySelector("[name=n]").value = init.n;
+load(init);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/form-chart")
+def form_chart():
+    from fastapi.responses import HTMLResponse
+
+    return HTMLResponse(FORM_CHART_HTML)
+
+
+@app.get("/match-card")
+def match_card(
+    league: str,
+    home: str,
+    away: str,
+    odd_home: float,
+    odd_draw: float = 0.0,
+    odd_away: float = 0.0,
+    pick: str = "H",
+    shrink: float = 10.0,
+):
+    """Card de analiza pentru un meci (liga = cod football-data, ex: E0).
+
+    pick: H = victorie gazde, D = egal, A = victorie oaspeti.
+    Numele echipelor sunt cele din football-data (ex: 'Man City', 'Tottenham').
+    """
+    pick = pick.upper()
+    if pick not in ("H", "D", "A"):
+        return {"error": "pick trebuie sa fie H, D sau A"}
+
+    with engine.connect() as conn:
+
+        def canon(name):
+            r = conn.execute(
+                text("""
+                SELECT t FROM (
+                    SELECT home AS t FROM hist_matches WHERE league = :l
+                    UNION ALL
+                    SELECT away AS t FROM hist_matches WHERE league = :l
+                ) x
+                WHERE t ILIKE :n
+                GROUP BY t ORDER BY COUNT(*) DESC LIMIT 1
+                """),
+                {"l": league, "n": f"%{name}%"},
+            ).fetchone()
+            return r[0] if r else None
+
+        h, a = canon(home), canon(away)
+        if not h or not a:
+            names = conn.execute(
+                text("SELECT DISTINCT home FROM hist_matches WHERE league = :l ORDER BY home"),
+                {"l": league},
+            ).fetchall()
+            return {
+                "error": "Echipa nu a fost gasita. Foloseste numele din football-data.",
+                "teams_in_league": [x[0] for x in names],
+            }
+
+        rows = conn.execute(
+            text("""
+            SELECT home, away, hg, ag, match_date
+            FROM hist_matches
+            WHERE league = :l
+            ORDER BY match_date, id
+            """),
+            {"l": league},
+        ).fetchall()
+
+    games = [(r[0], r[1], r[2], r[3]) for r in rows]
+    pred = predict_from_history(games, h, a, shrink=shrink)
+    if pred is None:
+        return {"error": "Prea putine meciuri istorice pentru una dintre echipe"}
+
+    _, _, (p_h, p_d, p_a) = pred
+    probs = {"H": p_h, "D": p_d, "A": p_a}
+    odds = {"H": odd_home, "D": odd_draw, "A": odd_away}
+    odd = odds[pick]
+    if odd <= 1:
+        return {"error": "Cota pentru selectia aleasa trebuie sa fie mai mare ca 1"}
+
+    if odd_home > 1 and odd_draw > 1 and odd_away > 1:
+        inv = [1 / odd_home, 1 / odd_draw, 1 / odd_away]
+        market = (1 / odd) / sum(inv)
+        market_note = "fara marja casei"
+    else:
+        market = 1 / odd
+        market_note = "implicita, include marja casei (da toate cele 3 cote pentru valoarea corecta)"
+
+    p = probs[pick]
+    edge = p * odd - 1
+    gap = abs(p - market)
+
+    def form(team):
+        g = [x for x in games if x[0] == team or x[1] == team][-5:]
+        pts = 0
+        for hh, aa, hg, ag in g:
+            gf, ga = (hg, ag) if hh == team else (ag, hg)
+            pts += 3 if gf > ga else (1 if gf == ga else 0)
+        return len(g), pts
+
+    nh, pts_h = form(h)
+    na, pts_a = form(a)
+
+    def count(team):
+        return sum(1 for x in games if x[0] == team or x[1] == team)
+
+    n_min = min(count(h), count(a))
+    sample_pts = 40 * min(1.0, n_min / 100)
+    agree_pts = 40 * max(0.0, 1 - gap / 0.15)
+    recent_pts = 20 if (nh == 5 and na == 5) else 0
+    confidence = round(sample_pts + agree_pts + recent_pts)
+
+    if edge >= 0.15:
+        label = "Diferenta foarte mare fata de piata: de obicei greseste modelul, nu e oportunitate"
+    elif edge >= 0.03:
+        label = "Edge teoretic mic, nedemonstrat in backtest"
+    else:
+        label = "Fara avantaj fata de piata"
+
+    return {
+        "match": f"{h} vs {a}",
+        "league": league,
+        "selection": {"H": f"Victorie {h}", "D": "Egal", "A": f"Victorie {a}"}[pick],
+        "odd": odd,
+        "model_prob_pct": round(p * 100, 1),
+        "market_prob_pct": round(market * 100, 1),
+        "market_note": market_note,
+        "fair_odd": round(1 / p, 2),
+        "edge_pct": round(edge * 100, 1),
+        "form_10": {
+            h: round(pts_h / 15 * 10, 1) if nh == 5 else None,
+            a: round(pts_a / 15 * 10, 1) if na == 5 else None,
+        },
+        "analysis_confidence_0_100": confidence,
+        "confidence_parts": {
+            "sample_size_max_40": round(sample_pts),
+            "model_vs_market_max_40": round(agree_pts),
+            "recent_matches_max_20": recent_pts,
+        },
+        "assessment": label,
+        "missing_inputs": ["lot disponibil", "accidentari", "suspendari", "motivatie"],
+        "warning": "Backtest-ul pe cote de inchidere nu a aratat avantaj fata de piata. Informativ, nu recomandare de pariuri.",
+    }
