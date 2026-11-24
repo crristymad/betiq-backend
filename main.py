@@ -333,3 +333,107 @@ def predict(home: str, away: str):
         },
         "sample_games": {"home_team_home": hs[2], "away_team_away": aw[2]},
     }
+def poisson_1x2(lam_h, lam_a, max_goals=10):
+    p_home = p_draw = p_away = 0.0
+    for i in range(max_goals + 1):
+        for j in range(max_goals + 1):
+            p = poisson_pmf(i, lam_h) * poisson_pmf(j, lam_a)
+            if i > j:
+                p_home += p
+            elif i == j:
+                p_draw += p
+            else:
+                p_away += p
+    total = p_home + p_draw + p_away
+    return p_home / total, p_draw / total, p_away / total
+
+
+def predict_from_history(history, home_id, away_id, min_games=3):
+    """history = lista de (home_id, away_id, home_goals, away_goals)"""
+    avg_h = sum(g[2] for g in history) / len(history)
+    avg_a = sum(g[3] for g in history) / len(history)
+
+    home_games = [g for g in history if g[0] == home_id]
+    away_games = [g for g in history if g[1] == away_id]
+    if len(home_games) < min_games or len(away_games) < min_games:
+        return None
+
+    home_attack = (sum(g[2] for g in home_games) / len(home_games)) / avg_h
+    home_defense = (sum(g[3] for g in home_games) / len(home_games)) / avg_a
+    away_attack = (sum(g[3] for g in away_games) / len(away_games)) / avg_a
+    away_defense = (sum(g[2] for g in away_games) / len(away_games)) / avg_h
+
+    lam_h = avg_h * home_attack * away_defense
+    lam_a = avg_a * away_attack * home_defense
+    return lam_h, lam_a, poisson_1x2(lam_h, lam_a)
+
+
+@app.get("/backtest-sample")
+def backtest_sample(warmup: int = 80, n: int = 40):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+            SELECT m.home_team_id, m.away_team_id, m.home_goals, m.away_goals,
+                   home_t.name, away_t.name
+            FROM matches m
+            JOIN teams home_t ON home_t.id = m.home_team_id
+            JOIN teams away_t ON away_t.id = m.away_team_id
+            WHERE m.api_id IS NOT NULL AND m.home_goals IS NOT NULL
+            ORDER BY m.kickoff, m.id
+            """)
+        ).fetchall()
+
+    games = [(r[0], r[1], r[2], r[3]) for r in rows]
+    names = [(r[4], r[5]) for r in rows]
+
+    results = []
+    skipped = 0
+    b_model = b_naive = l_model = l_naive = 0.0
+
+    for i in range(warmup, min(warmup + n, len(games))):
+        history = games[:i]
+        hid, aid, hg, ag = games[i]
+
+        pred = predict_from_history(history, hid, aid)
+        if pred is None:
+            skipped += 1
+            continue
+        lam_h, lam_a, model_p = pred
+
+        # varianta naiva: frecventa rezultatelor de pana atunci
+        naive_p = (
+            sum(1 for g in history if g[2] > g[3]) / len(history),
+            sum(1 for g in history if g[2] == g[3]) / len(history),
+            sum(1 for g in history if g[2] < g[3]) / len(history),
+        )
+
+        actual = 0 if hg > ag else (1 if hg == ag else 2)
+        outcome = [1 if k == actual else 0 for k in range(3)]
+
+        b_m = sum((model_p[k] - outcome[k]) ** 2 for k in range(3))
+        b_n = sum((naive_p[k] - outcome[k]) ** 2 for k in range(3))
+        b_model += b_m
+        b_naive += b_n
+        l_model += -math.log(max(model_p[actual], 1e-9))
+        l_naive += -math.log(max(naive_p[actual], 1e-9))
+
+        results.append({
+            "match": f"{names[i][0]} {hg}-{ag} {names[i][1]}",
+            "model_1x2": [round(p * 100, 1) for p in model_p],
+            "naive_1x2": [round(p * 100, 1) for p in naive_p],
+            "actual": ["1", "X", "2"][actual],
+        })
+
+    k = len(results)
+    if k == 0:
+        return {"error": "Nu s-au putut evalua meciuri", "skipped": skipped}
+
+    return {
+        "evaluated": k,
+        "skipped": skipped,
+        "model": {"brier": round(b_model / k, 4), "log_loss": round(l_model / k, 4)},
+        "naive": {"brier": round(b_naive / k, 4), "log_loss": round(l_naive / k, 4)},
+        "reference_random_guess": {"brier": 0.6667, "log_loss": 1.0986},
+        "model_better_than_naive": b_model < b_naive,
+        "matches": results,
+    }
