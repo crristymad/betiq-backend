@@ -56,3 +56,35 @@ def teams():
         }
         for r in rows
     ]
+@app.get("/matches")
+def matches():
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT
+                m.id,
+                ht.name as home_team,
+                at.name as away_team,
+                m.kickoff,
+                m.status
+            FROM matches m
+            JOIN teams ht
+                ON ht.id = m.home_team_id
+            JOIN teams at
+                ON at.id = m.away_team_id
+            ORDER BY m.kickoff
+            """)
+        ).fetchall()
+
+    return [
+        {
+            "id": r[0],
+            "home_team": r[1],
+            "away_team": r[2],
+            "kickoff": str(r[3]),
+            "status": r[4]
+        }
+        for r in rows
+    ]
