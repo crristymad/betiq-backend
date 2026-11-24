@@ -108,23 +108,40 @@ def top_bets():
         rows = conn.execute(
             text("""
             SELECT
-                p.id,
+                ht.name as home_team,
+                at.name as away_team,
+
                 br.recommended_odd,
                 br.edge_percent,
+
+                p.probability,
                 p.confidence_score
+
             FROM predictions p
+
+            JOIN matches m
+                ON m.id = p.match_id
+
+            JOIN teams ht
+                ON ht.id = m.home_team_id
+
+            JOIN teams at
+                ON at.id = m.away_team_id
+
             JOIN bet_recommendations br
                 ON br.prediction_id = p.id
-            ORDER BY br.edge_percent DESC
+
+            ORDER BY p.confidence_score DESC
             """)
         ).fetchall()
 
     return [
         {
-            "prediction_id": r[0],
-            "recommended_odd": float(r[1]),
-            "edge_percent": float(r[2]),
-            "confidence": float(r[3])
+            "match": f"{r[0]} vs {r[1]}",
+            "odd": float(r[2]),
+            "edge": float(r[3]),
+            "probability": float(r[4]),
+            "confidence": float(r[5])
         }
         for r in rows
     ]
