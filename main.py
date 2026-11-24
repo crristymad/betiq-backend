@@ -100,3 +100,31 @@ def matches():
         }
         for r in rows
     ]
+@app.get("/top-bets")
+def top_bets():
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(
+            text("""
+            SELECT
+                p.id,
+                br.recommended_odd,
+                br.edge_percent,
+                p.confidence_score
+            FROM predictions p
+            JOIN bet_recommendations br
+                ON br.prediction_id = p.id
+            ORDER BY br.edge_percent DESC
+            """)
+        ).fetchall()
+
+    return [
+        {
+            "prediction_id": r[0],
+            "recommended_odd": float(r[1]),
+            "edge_percent": float(r[2]),
+            "confidence": float(r[3])
+        }
+        for r in rows
+    ]
