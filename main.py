@@ -394,7 +394,7 @@ def backtest_sample(warmup: int = 80, n: int = 40, shrink: float = 0.0):
         history = games[:i]
         hid, aid, hg, ag = games[i]
 
-       pred = predict_from_history(history, hid, aid, shrink=shrink)
+        pred = predict_from_history(history, hid, aid, shrink=shrink)
         if pred is None:
             skipped += 1
             continue
