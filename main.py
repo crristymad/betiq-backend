@@ -437,3 +437,84 @@ def backtest_sample(warmup: int = 80, n: int = 40, shrink: float = 0.0):
         "model_better_than_naive": b_model < b_naive,
         "matches": results,
     }
+@app.get("/value-check")
+def value_check(
+    home: str,
+    away: str,
+    odd_home: float,
+    odd_draw: float,
+    odd_away: float,
+    shrink: float = 10.0,
+    min_edge: float = 0.05,
+):
+    with engine.connect() as conn:
+
+        def find_team(name):
+            return conn.execute(
+                text("""
+                SELECT id, name FROM teams
+                WHERE api_id IS NOT NULL AND name ILIKE :n
+                ORDER BY name LIMIT 1
+                """),
+                {"n": f"%{name}%"},
+            ).fetchone()
+
+        h, a = find_team(home), find_team(away)
+        if not h or not a:
+            return {"error": "Echipa nu a fost gasita. Verifica numele in /teams"}
+
+        rows = conn.execute(
+            text("""
+            SELECT home_team_id, away_team_id, home_goals, away_goals
+            FROM matches
+            WHERE api_id IS NOT NULL AND home_goals IS NOT NULL
+            ORDER BY kickoff, id
+            """)
+        ).fetchall()
+
+    games = [(r[0], r[1], r[2], r[3]) for r in rows]
+    pred = predict_from_history(games, h[0], a[0], shrink=shrink)
+    if pred is None:
+        return {"error": "Prea putine meciuri istorice pentru una dintre echipe"}
+
+    lam_h, lam_a, probs = pred
+    odds = [odd_home, odd_draw, odd_away]
+    labels = ["home", "draw", "away"]
+
+    # probabilitatea implicita a pietei, fara marja casei
+    inv = [1 / o for o in odds]
+    overround = sum(inv)
+    market = [x / overround for x in inv]
+
+    outcomes = []
+    best = None
+    for k in range(3):
+        edge = probs[k] * odds[k] - 1
+        item = {
+            "outcome": labels[k],
+            "odd": odds[k],
+            "model_prob_pct": round(probs[k] * 100, 1),
+            "market_prob_pct": round(market[k] * 100, 1),
+            "fair_odd": round(1 / probs[k], 2),
+            "edge_pct": round(edge * 100, 1),
+        }
+        outcomes.append(item)
+        if best is None or edge > best[0]:
+            best = (edge, labels[k])
+
+    best_edge, best_label = best
+    if best_edge >= 0.15:
+        verdict = f"Edge foarte mare pe {best_label}: suspect, probabil greseste modelul. Nu paria pe baza asta."
+    elif best_edge >= min_edge:
+        verdict = f"Edge teoretic pozitiv pe {best_label}, dar avantajul modelului e mic. Interpreteaza cu prudenta."
+    else:
+        verdict = "Nu paria: nicio cota nu depaseste pragul de edge."
+
+    return {
+        "match": f"{h[1]} vs {a[1]}",
+        "shrink": shrink,
+        "bookmaker_margin_pct": round((overround - 1) * 100, 1),
+        "outcomes": outcomes,
+        "verdict": verdict,
+        "warning": "Model antrenat pe date 2021-2023, cu avantaj mic fata de frecventa simpla a rezultatelor. Nu e sfat financiar.",
+    }
