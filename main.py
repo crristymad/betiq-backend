@@ -654,3 +654,36 @@ def hist_summary():
         }
         for r in rows
     ]
+
+
+@app.post("/import-fd-all")
+def import_fd_all(
+    leagues: str = "E0,SC0,D1",
+    seasons: str = "2526,2425,2324,2223,2122,2021",
+    pause: float = 1.0,
+):
+    """Importa mai multe ligi/sezoane football-data.co.uk, cate un fisier pe rand."""
+    import time
+
+    league_list = [x.strip() for x in leagues.split(",") if x.strip()]
+    season_list = [x.strip() for x in seasons.split(",") if x.strip()]
+
+    total = 0
+    files = 0
+    failed = []
+
+    for lg in league_list:
+        for se in season_list:
+            files += 1
+            try:
+                r = import_fd(league=lg, season=se)
+            except Exception as e:
+                r = {"error": str(e)[:200]}
+
+            if r.get("error"):
+                failed.append({"league": lg, "season": se, "error": r["error"]})
+            else:
+                total += r.get("inserted", 0)
+            time.sleep(pause)
+
+    return {"files_tried": files, "total_inserted": total, "failed": failed}
