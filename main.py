@@ -687,3 +687,117 @@ def import_fd_all(
             time.sleep(pause)
 
     return {"files_tried": files, "total_inserted": total, "failed": failed}
+@app.get("/backtest-odds")
+def backtest_odds(
+    leagues: str = "E0",
+    warmup: int = 300,
+    shrink: float = 10.0,
+    lo: float = 1.4,
+    hi: float = 1.7,
+    min_edge: float = 0.0,
+    use_close: bool = False,
+):
+    """Simuleaza pariuri de 1 unitate pe victoria gazdei/oaspetelui, cu cota intre lo si hi.
+
+    baseline = pariaza pe orice favorit cu cota in interval (fara model)
+    model    = alege echipa cu probabilitatea cea mai mare dupa model,
+               doar daca edge = p * cota - 1 >= min_edge
+    """
+    league_list = [x.strip() for x in leagues.split(",") if x.strip()]
+
+    def summarize(profits):
+        n = len(profits)
+        if n == 0:
+            return {"bets": 0}
+        wins = sum(1 for p in profits if p > 0)
+        total = sum(profits)
+        mean = total / n
+        var = sum((p - mean) ** 2 for p in profits) / n
+        se = (var / n) ** 0.5
+        return {
+            "bets": n,
+            "wins": wins,
+            "hit_rate_pct": round(100 * wins / n, 1),
+            "profit_units": round(total, 2),
+            "roi_pct": round(100 * mean, 2),
+            "roi_se_pct": round(100 * se, 2),
+        }
+
+    by_league = []
+    all_model, all_base = [], []
+
+    with engine.connect() as conn:
+        for lg in league_list:
+            rows = conn.execute(
+                text("""
+                SELECT home, away, hg, ag,
+                       odd_h, odd_a, close_h, close_a
+                FROM hist_matches
+                WHERE league = :l
+                ORDER BY match_date, id
+                """),
+                {"l": lg},
+            ).fetchall()
+
+            games = [(r[0], r[1], r[2], r[3]) for r in rows]
+            base, model = [], []
+            evaluated = 0
+
+            for i in range(warmup, len(rows)):
+                r = rows[i]
+                if use_close and r[6] and r[7]:
+                    oh, oa = float(r[6]), float(r[7])
+                elif r[4] and r[5]:
+                    oh, oa = float(r[4]), float(r[5])
+                else:
+                    continue
+                evaluated += 1
+
+                cands = []
+                if lo <= oh <= hi:
+                    cands.append(("H", oh))
+                if lo <= oa <= hi:
+                    cands.append(("A", oa))
+                if not cands:
+                    continue
+
+                hg, ag = r[2], r[3]
+
+                def result(side, odd):
+                    won = hg > ag if side == "H" else ag > hg
+                    return (odd - 1) if won else -1.0
+
+                # baseline: favoritul cu cota cea mai mica din interval
+                side_b, odd_b = min(cands, key=lambda c: c[1])
+                base.append(result(side_b, odd_b))
+
+                pred = predict_from_history(games[:i], r[0], r[1], shrink=shrink)
+                if pred is None:
+                    continue
+                p_home, _, p_away = pred[2]
+                options = [
+                    (side, odd, p_home if side == "H" else p_away)
+                    for side, odd in cands
+                ]
+                side_m, odd_m, p_m = max(options, key=lambda o: o[2])
+                if p_m * odd_m - 1 >= min_edge:
+                    model.append(result(side_m, odd_m))
+
+            all_base += base
+            all_model += model
+            by_league.append({
+                "league": lg,
+                "matches_evaluated": evaluated,
+                "baseline": summarize(base),
+                "model": summarize(model),
+            })
+
+    return {
+        "params": {
+            "warmup": warmup, "shrink": shrink, "odds_range": [lo, hi],
+            "min_edge": min_edge, "odds_used": "close" if use_close else "pre-match (Bet365)",
+        },
+        "total": {"baseline": summarize(all_base), "model": summarize(all_model)},
+        "by_league": by_league,
+        "note": "roi_se_pct = eroarea standard; daca |roi_pct| < 2 * roi_se_pct, rezultatul nu e diferit de zgomot.",
+    }
